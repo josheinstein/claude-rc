@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# claude-rc-add — register the current directory (or the one given) as a
+# boot-time `claude rc` Remote Control session and start it right away.
+# Thin wrapper around: claude-rc-ctl add [dir]
+exec "$HOME/.local/bin/claude-rc-ctl" add "${1:-$PWD}"

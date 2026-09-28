@@ -1,0 +1,17 @@
+[Unit]
+Description=Claude Code Remote Control sessions (from sessions.conf)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -lic 'exec "$HOME/.local/bin/claude-rc-ctl" sync'
+ExecReload=/bin/bash -lic 'exec "$HOME/.local/bin/claude-rc-ctl" sync'
+ExecStop=/bin/bash -lic 'exec "$HOME/.local/bin/claude-rc-ctl" stop-all'
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=claude-rc-sync
+
+[Install]
+WantedBy=default.target

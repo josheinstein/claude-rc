@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""List Claude Code sessions that were cut off mid-turn rather than finishing.
+
+A session is "unfinished" when its last substantive entry is not a completed
+assistant turn — i.e. it ends on an interrupt marker or on a tool result that
+never got a reply. Sessions last written before the current boot could not have
+been finished since, so those are the ones a reboot interrupted.
+"""
+import json, os, sys, glob, time, argparse
+
+META = {"last-prompt", "ai-title", "atis-latch", "bridge-session", "system",
+        "permission-mode", "attachment", "queue-operation", "summary"}
+
+def boot_time():
+    try:
+        for line in open("/proc/stat"):
+            if line.startswith("btime"):
+                return float(line.split()[1])
+    except Exception:
+        pass
+    return 0.0
+
+def blocks(row):
+    m = row.get("message") or {}
+    c = m.get("content")
+    return c if isinstance(c, list) else []
+
+def text_of(row):
+    m = row.get("message") or {}
+    c = m.get("content")
+    if isinstance(c, str):
+        return c
+    out = []
+    for b in blocks(row):
+        if isinstance(b, dict) and b.get("type") == "text":
+            out.append(b.get("text") or "")
+    return "\n".join(out)
+
+def analyse(path):
+    rows = []
+    try:
+        with open(path, errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    pass
+    except Exception:
+        return None
+    if not rows:
+        return None
+
+    # Last entry that actually carries conversation, ignoring bookkeeping rows.
+    last = None
+    for r in reversed(rows):
+        if r.get("type") in META:
+            continue
+        last = r
+        break
+    if last is None:
+        return None
+
+    msg = last.get("message") or {}
+    finished = (last.get("type") == "assistant" and msg.get("stop_reason") == "end_turn")
+    interrupted_marker = "[Request interrupted" in text_of(last)
+
+    # Most recent thing the human actually typed.
+    prompt = ""
+    for r in reversed(rows):
+        if r.get("type") == "user" and (r.get("message") or {}).get("role") == "user":
+            t = text_of(r).strip()
+            if t and not t.startswith("[Request interrupted") and "<local-command" not in t:
+                prompt = " ".join(t.split())
+                break
+    cwd = ""
+    for r in rows:
+        if r.get("cwd"):
+            cwd = r["cwd"]
+            break
+    return {"finished": finished, "interrupted": interrupted_marker,
+            "rows": len(rows), "prompt": prompt, "cwd": cwd}
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--days", type=float, default=14,
+                    help="only consider transcripts touched in the last N days (default 14)")
+    ap.add_argument("--window", type=float, default=2.0,
+                    help="only sessions last written within N hours BEFORE the boot "
+                         "(default 2; these are the ones the reboot cut off)")
+    ap.add_argument("--all", action="store_true",
+                    help="ignore the boot/window filters; show every unfinished session")
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args()
+
+    bt = boot_time()
+    cutoff = time.time() - args.days * 86400
+    home = os.path.expanduser("~")
+    found = []
+
+    for p in glob.glob(os.path.join(home, ".claude/projects/*/*.jsonl")):
+        mt = os.path.getmtime(p)
+        if mt < cutoff:
+            continue
+        if not args.all:
+            if mt > bt:
+                continue      # written this boot; not a reboot casualty
+            if args.window and mt < bt - args.window * 3600:
+                continue      # long dead before the reboot; just an old session
+        info = analyse(p)
+        if not info or info["finished"]:
+            continue
+        cwd = info.get("cwd") or ""
+        if not cwd:
+            # last resort; mangles directory names containing "-"
+            proj = os.path.basename(os.path.dirname(p))
+            cwd = "/" + proj.strip("-").replace("-", "/")
+        rec = {"session": os.path.basename(p)[:-6], "mtime": mt, "path": p}
+        rec.update(info)
+        rec["cwd"] = cwd
+        found.append(rec)
+
+    found.sort(key=lambda d: d["mtime"], reverse=True)
+
+    if args.json:
+        print(json.dumps(found, indent=2))
+        return 0
+    if not found:
+        print("No interrupted sessions found.")
+        return 0
+
+    print(f"{len(found)} unfinished session(s) — last written before this boot "
+          f"({time.strftime('%Y-%m-%d %H:%M', time.localtime(bt))}):\n")
+    for d in found:
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(d["mtime"]))
+        cwd_disp = d["cwd"].replace(home, "~")
+        flag = "interrupted mid-tool-use" if d["interrupted"] else "ended mid-turn"
+        print(f"  {cwd_disp}")
+        print(f"    {when}  ({d['rows']} msgs, {flag})")
+        if d["prompt"]:
+            pr = d["prompt"]
+            print(f"    last prompt: \"{pr[:110]}{'...' if len(pr) > 110 else ''}\"")
+        print(f"    resume: cd {cwd_disp} && claude --resume {d['session']}")
+        print()
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

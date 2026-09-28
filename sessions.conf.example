@@ -1,0 +1,16 @@
+# Directories that get a `claude rc` Remote Control session at boot.
+#
+#   - One directory per line.
+#   - Blank lines and #-comments are ignored.
+#   - "~" is expanded; relative paths are not allowed.
+#   - The session name shown in claude.ai/code is the directory's basename.
+#     Duplicate basenames get -2, -3, ... appended.
+#
+# After editing this file, apply it with:   claude-rc-ctl sync
+# (no reboot needed; unchanged entries are left running untouched)
+#
+# NOTE: a directory must have been trusted once by running `claude` in it
+# interactively. `claude-rc-ctl list` shows trust status per entry.
+
+~/repos/my-project
+~/docker

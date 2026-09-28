@@ -1,0 +1,253 @@
+#!/usr/bin/env bash
+# claude-rc-ctl — run a `claude rc` Remote Control session per directory,
+# driven by a plain text list at ~/.config/claude-rc/sessions.conf.
+#
+# Each entry becomes a supervised systemd user service: claude-rc@<name>.service
+# Only claude-rc.service is enabled at boot; it syncs the list on startup.
+
+set -uo pipefail
+
+CONF="${CLAUDE_RC_CONF:-$HOME/.config/claude-rc/sessions.conf}"
+RC_ARGS=(--permission-mode auto --no-create-session-in-dir)
+EXIT_CONFIG=78   # matches RestartPreventExitStatus= in the unit: do not retry
+
+die() { printf 'claude-rc-ctl: %s\n' "$*" >&2; exit 1; }
+
+trim() { local s=$1; s="${s#"${s%%[![:space:]]*}"}"; printf '%s' "${s%"${s##*[![:space:]]}"}"; }
+
+# Emit "name<TAB>path" for each valid config entry.
+parse_conf() {
+  [[ -r $CONF ]] || die "no config file at $CONF"
+  local line path base name n
+  declare -A used=()
+  while IFS= read -r line || [[ -n $line ]]; do
+    line="${line%%#*}"
+    line=$(trim "$line")
+    [[ -z $line ]] && continue
+    path=$line
+    [[ $path == "~" ]] && path=$HOME
+    [[ $path == "~/"* ]] && path="$HOME/${path#\~/}"
+    if [[ $path != /* ]]; then
+      printf 'claude-rc-ctl: skipping non-absolute path: %s\n' "$line" >&2
+      continue
+    fi
+    path="${path%/}"; [[ -z $path ]] && path=/
+    base=$(basename -- "$path")
+    name="${base//[^A-Za-z0-9_-]/_}"
+    [[ -z $name ]] && name=root
+    if [[ -n ${used[$name]:-} ]]; then
+      n=2; while [[ -n ${used[${name}-$n]:-} ]]; do n=$((n+1)); done
+      name="${name}-$n"
+    fi
+    used[$name]=1
+    printf '%s\t%s\n' "$name" "$path"
+  done < "$CONF"
+}
+
+path_for() {
+  local want=$1 name path
+  while IFS=$'\t' read -r name path; do
+    [[ $name == "$want" ]] && { printf '%s' "$path"; return 0; }
+  done < <(parse_conf)
+  return 1
+}
+
+# Is the directory trust-accepted in ~/.claude.json?
+is_trusted() {
+  # NOTE: `claude rc` checks the exact directory only — trusting ~/repos does
+  # NOT cover ~/repos/foo — so this is an exact-path lookup, no ancestor walk.
+  python3 - "$1" <<'PY' 2>/dev/null
+import json,os,sys
+try: d=json.load(open(os.path.expanduser("~/.claude.json")))
+except Exception: sys.exit(1)
+e=d.get("projects",{}).get(os.path.realpath(sys.argv[1]))
+sys.exit(0 if isinstance(e,dict) and e.get("hasTrustDialogAccepted") else 1)
+PY
+}
+
+desired_names() { parse_conf | cut -f1; }
+
+# Instances systemd currently knows about (active or failed).
+current_names() {
+  systemctl --user list-units --all --no-legend --plain 'claude-rc@*.service' 2>/dev/null \
+    | awk '{print $1}' | sed -n 's/^claude-rc@\(.*\)\.service$/\1/p'
+}
+
+cmd_list() {
+  local name path trust state
+  printf '%-16s %-14s %-10s %s\n' NAME TRUSTED STATE PATH
+  while IFS=$'\t' read -r name path; do
+    if [[ ! -d $path ]]; then trust="NO-SUCH-DIR"
+    elif is_trusted "$path"; then trust="yes"
+    else trust="NOT TRUSTED"; fi
+    state=$(systemctl --user is-active "claude-rc@$name.service" 2>/dev/null || true)
+    printf '%-16s %-14s %-10s %s\n' "$name" "$trust" "${state:-inactive}" "$path"
+  done < <(parse_conf)
+}
+
+cmd_sync() {
+  local -A want=(); local name path
+  while IFS=$'\t' read -r name path; do
+    want[$name]=$path
+    if [[ ! -d $path ]]; then
+      printf 'claude-rc-ctl: %-14s SKIP (directory does not exist: %s)\n' "$name" "$path" >&2
+      continue
+    fi
+    if ! is_trusted "$path"; then
+      printf 'claude-rc-ctl: %-14s SKIP (not trusted — run `claude` in %s once)\n' "$name" "$path" >&2
+      continue
+    fi
+    if [[ $(systemctl --user is-active "claude-rc@$name.service" 2>/dev/null) == active ]]; then
+      printf 'claude-rc-ctl: %-14s already running\n' "$name"
+    else
+      printf 'claude-rc-ctl: %-14s starting (%s)\n' "$name" "$path"
+      # --no-block: we may ourselves be running as a unit; blocking would deadlock.
+      systemctl --user start --no-block "claude-rc@$name.service"
+    fi
+  done < <(parse_conf)
+
+  # Stop anything systemd still runs that the config no longer lists.
+  while read -r name; do
+    [[ -z $name ]] && continue
+    if [[ -z ${want[$name]:-} ]]; then
+      printf 'claude-rc-ctl: %-14s stopping (removed from config)\n' "$name"
+      systemctl --user stop "claude-rc@$name.service"
+      systemctl --user reset-failed "claude-rc@$name.service" 2>/dev/null
+    fi
+  done < <(current_names)
+}
+
+# Normalise a user-supplied directory to an absolute path with ~ folded back in
+# (so the config stays readable and matches the existing entries).
+norm_dir() {
+  local d=${1:-.} abs
+  abs=$(cd -- "$d" 2>/dev/null && pwd -P) || return 1
+  if [[ $abs == "$HOME" ]]; then printf '~'
+  elif [[ $abs == "$HOME/"* ]]; then printf '~/%s' "${abs#"$HOME"/}"
+  else printf '%s' "$abs"; fi
+}
+
+# Does the config already contain this directory (after expansion)?
+conf_has() {
+  local want=$1 name path
+  while IFS=$'\t' read -r name path; do
+    [[ $(realpath -m -- "$path") == "$want" ]] && return 0
+  done < <(parse_conf)
+  return 1
+}
+
+# add [dir]: append a directory (default: cwd) to the config and sync.
+cmd_add() {
+  local dir=${1:-$PWD} entry abs
+  [[ -d $dir ]] || die "add: no such directory: $dir"
+  entry=$(norm_dir "$dir") || die "add: cannot resolve $dir"
+  abs=$(realpath -m -- "$dir")
+  mkdir -p -- "$(dirname -- "$CONF")"
+  [[ -e $CONF ]] || : > "$CONF"
+  if conf_has "$abs"; then
+    printf 'claude-rc-ctl: %s is already in %s\n' "$entry" "$CONF"
+  else
+    # Make sure we append on a fresh line even if the file lacks a trailing newline.
+    [[ -s $CONF && $(tail -c1 -- "$CONF" | wc -l) -eq 0 ]] && printf '\n' >> "$CONF"
+    printf '%s\n' "$entry" >> "$CONF"
+    printf 'claude-rc-ctl: added %s to %s\n' "$entry" "$CONF"
+  fi
+  if ! is_trusted "$abs"; then
+    printf 'claude-rc-ctl: WARNING: %s is not trusted yet — run `claude` there once and accept the trust dialog, then `claude-rc-ctl sync`.\n' "$abs" >&2
+  fi
+  cmd_sync
+}
+
+# remove [dir]: drop a directory (default: cwd) from the config and sync.
+cmd_remove() {
+  local dir=${1:-$PWD} abs tmp line path
+  abs=$(realpath -m -- "$dir")
+  [[ -r $CONF ]] || die "no config file at $CONF"
+  tmp=$(mktemp) || die "remove: mktemp failed"
+  local removed=0
+  while IFS= read -r line || [[ -n $line ]]; do
+    path=$(trim "${line%%#*}")
+    [[ $path == "~" ]] && path=$HOME
+    [[ $path == "~/"* ]] && path="$HOME/${path#\~/}"
+    if [[ -n $path && $(realpath -m -- "$path") == "$abs" ]]; then
+      removed=1; continue
+    fi
+    printf '%s\n' "$line" >> "$tmp"
+  done < "$CONF"
+  if (( removed )); then
+    cat -- "$tmp" > "$CONF"; rm -f -- "$tmp"
+    printf 'claude-rc-ctl: removed %s from %s\n' "$abs" "$CONF"
+    cmd_sync
+  else
+    rm -f -- "$tmp"
+    printf 'claude-rc-ctl: %s was not in %s\n' "$abs" "$CONF"
+  fi
+}
+
+cmd_stop_all() {
+  local name
+  while read -r name; do
+    [[ -z $name ]] && continue
+    printf 'claude-rc-ctl: stopping %s\n' "$name"
+    systemctl --user stop "claude-rc@$name.service"
+  done < <(current_names)
+}
+
+# Internal: invoked by claude-rc@.service via a login shell.
+cmd_run() {
+  local name=${1:-} path
+  [[ -n $name ]] || die "run: missing instance name"
+  path=$(path_for "$name") || {
+    echo "claude-rc-ctl: '$name' is no longer in $CONF" >&2; exit $EXIT_CONFIG; }
+  [[ -d $path ]] || { echo "claude-rc-ctl: no such directory: $path" >&2; exit $EXIT_CONFIG; }
+  is_trusted "$path" || {
+    echo "claude-rc-ctl: $path is not trusted. Run \`claude\` there once and accept the trust dialog." >&2
+    exit $EXIT_CONFIG; }
+
+  # Bounded wait for DNS/network — at boot we can start before the network is up.
+  local i
+  for i in $(seq 1 60); do
+    getent hosts api.anthropic.com >/dev/null 2>&1 && break
+    sleep 2
+  done
+
+  cd "$path" || exit $EXIT_CONFIG
+  echo "claude-rc-ctl: starting 'claude rc ${RC_ARGS[*]} --name $name' in $path"
+  exec claude rc "${RC_ARGS[@]}" --name "$name"
+}
+
+case "${1:-}" in
+  list)      cmd_list ;;
+  sync)      cmd_sync ;;
+  add)       shift; cmd_add "$@" ;;
+  remove|rm) shift; cmd_remove "$@" ;;
+  stop-all)  cmd_stop_all ;;
+  run)       shift; cmd_run "$@" ;;
+  start)     [[ -n ${2:-} ]] && systemctl --user start "claude-rc@$2.service" || cmd_sync ;;
+  stop)      [[ -n ${2:-} ]] && systemctl --user stop  "claude-rc@$2.service" || cmd_stop_all ;;
+  restart)   [[ -n ${2:-} ]] && systemctl --user restart "claude-rc@$2.service" \
+                             || { cmd_stop_all; cmd_sync; } ;;
+  status)    systemctl --user status --no-pager 'claude-rc@*.service' ;;
+  logs)      if [[ -n ${2:-} ]]; then journalctl --user -u "claude-rc@$2.service" -f
+             else journalctl --user -u 'claude-rc@*' -f; fi ;;
+  edit)      "${EDITOR:-nano}" "$CONF" ;;
+  ""|-h|--help|help)
+    cat <<'USAGE'
+claude-rc-ctl — boot-time `claude rc` sessions, one per directory
+
+  list             show configured dirs, trust status, and running state
+  sync             apply the config: start new entries, stop removed ones
+  add    [dir]     add a directory (default: cwd) to the config, then sync
+  remove [dir]     remove a directory (default: cwd) from the config, then sync
+  start [name]     start one session (or sync everything)
+  stop  [name]     stop one session (or all)
+  restart [name]   restart one session (or all)
+  status           systemctl status for all sessions
+  logs  [name]     follow the journal for one session (or all)
+  edit             open the config in $EDITOR
+
+Config: ~/.config/claude-rc/sessions.conf
+USAGE
+    ;;
+  *) die "unknown command '$1' (try --help)" ;;
+esac

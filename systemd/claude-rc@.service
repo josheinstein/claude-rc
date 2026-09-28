@@ -1,0 +1,28 @@
+[Unit]
+Description=Claude Code Remote Control — %i
+Documentation=man:claude-rc-ctl
+# Hot-loop guard: if it fails 5 times in 5 minutes, give up until manually started.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# A login shell so the session gets the same PATH/env as an interactive terminal
+# (nvm, miniforge, dotnet, ~/.local/bin — all set up via ~/.profile -> ~/.bashrc).
+ExecStart=/bin/bash -lic 'exec "$HOME/.local/bin/claude-rc-ctl" run %i'
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=claude-rc-%i
+
+Restart=on-failure
+RestartSec=15
+# Exit 78 = bad config (missing dir / untrusted / removed from list). Don't retry.
+RestartPreventExitStatus=78
+
+# Long-lived interactive-ish workload: never let it be a soft OOM target.
+OOMPolicy=continue
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target
