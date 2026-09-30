@@ -5,7 +5,7 @@ sessions, one per directory, supervised by systemd user units.
 
 You list directories in a plain text file; every entry becomes a
 `claude rc` session that appears in claude.ai/code under the directory's
-basename, starts at boot, restarts on failure, and is stopped when you remove
+basename, starts at boot, restarts when it exits, and is stopped when you remove
 it from the list.
 
 ## How it works
@@ -24,8 +24,10 @@ Instances run through a login shell (`bash -lic`) so the session sees the same
 `claude rc` is started with `--permission-mode auto --no-create-session-in-dir`.
 
 Exit code 78 from the controller means "bad config" (directory missing,
-untrusted, or removed from the list) and the unit does not retry it. Other
-failures restart after 15 s, at most 5 times in 5 minutes.
+untrusted, or removed from the list) and the unit does not retry it. Any
+other exit restarts after 15 s, at most 5 times in 5 minutes. That includes a
+clean one: when the server is unreachable for ~11 minutes (a network outage)
+`claude rc` gives up and exits 0, and the unit brings it back.
 
 ## Install
 

@@ -15,7 +15,10 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=claude-rc-%i
 
-Restart=on-failure
+# always, not on-failure: after ~11 min without the server `claude rc` logs
+# "giving up" and exits 0, which on-failure treats as done. Each give-up takes
+# that long, so outages never reach the start limit above.
+Restart=always
 RestartSec=15
 # Exit 78 = bad config (missing dir / untrusted / removed from list). Don't retry.
 RestartPreventExitStatus=78
